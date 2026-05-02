@@ -1,0 +1,6 @@
+build/
+runtime_dumps/
+notes/
+*.log
+*.tmp
+*.bak
