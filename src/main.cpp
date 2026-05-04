@@ -14,6 +14,11 @@
 #include <cstring>
 #include <string>
 #include <unordered_set>
+#include <utility>
+
+#ifndef _M_IX86
+#error BioPatch must be built as 32-bit x86.
+#endif
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -62,6 +67,18 @@ struct TimerState {
     LARGE_INTEGER start_qpc{};
     DWORD base_time_get_time = 0;
     bool ready = false;
+};
+
+struct PreciseSleepTimerState {
+    HANDLE handle = nullptr;
+    bool attempted_high_res = false;
+
+    ~PreciseSleepTimerState() {
+        if (handle != nullptr) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+    }
 };
 
 struct InputProbeState {
@@ -328,8 +345,7 @@ GetPrivateProfileStringAFn g_original_get_private_profile_string_a = nullptr;
 WritePrivateProfileStringAFn g_original_write_private_profile_string_a = nullptr;
 SetUnhandledExceptionFilterFn g_original_set_unhandled_exception_filter = nullptr;
 GetProcAddressFn g_original_get_proc_address = nullptr;
-thread_local HANDLE g_precise_sleep_timer = nullptr;
-thread_local bool g_precise_sleep_timer_attempted_high_res = false;
+thread_local PreciseSleepTimerState g_precise_sleep_timer;
 void* g_original_worker_state_dispatch = nullptr;
 void* g_original_worker_state_request3 = nullptr;
 void* g_original_worker_state_request4 = nullptr;
@@ -344,6 +360,7 @@ D3D9DeviceResetFn g_original_d3d9_reset = nullptr;
 D3D9DevicePresentFn g_original_d3d9_present = nullptr;
 void* g_original_qfps_element_copy = nullptr;
 bool g_thread_join_hook_installed = false;
+bool g_supported_game_build = false;
 
 LPTOP_LEVEL_EXCEPTION_FILTER g_downstream_exception_filter = nullptr;
 LONG g_dump_written = 0;
@@ -359,6 +376,8 @@ constexpr GUID kIID_DirectInput8W = {
     0xBF798031, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
 constexpr GUID kIID_DirectInputDevice8A = {
     0x54D41080, 0xDC15, 0x4833, {0xA4, 0x1B, 0x74, 0x8F, 0x73, 0xA3, 0x81, 0x79}};
+constexpr GUID kIID_DirectInputDevice8W = {
+    0x54D41081, 0xDC15, 0x4833, {0xA4, 0x1B, 0x74, 0x8F, 0x73, 0xA3, 0x81, 0x79}};
 constexpr GUID kIID_Direct3D9 = {
     0x81BDCBCA, 0x64D4, 0x426D, {0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C}};
 constexpr GUID kIID_Direct3D9Ex = {
@@ -453,6 +472,10 @@ constexpr std::size_t kD3D9DeviceTestCooperativeLevelVtableSlot = 3;
 constexpr std::size_t kD3D9DeviceCreateAdditionalSwapChainVtableSlot = 13;
 constexpr std::size_t kD3D9DeviceResetVtableSlot = 16;
 constexpr std::size_t kD3D9DevicePresentVtableSlot = 17;
+constexpr WORD kSupportedGameMachine = IMAGE_FILE_MACHINE_I386;
+constexpr DWORD kSupportedGameTimeDateStamp = 0x5C9057AC;
+constexpr DWORD kSupportedGameSizeOfImage = 0x01210000;
+constexpr ULONGLONG kSupportedGameFileSize = 18315248ULL;
 
 bool g_hot_input_block_dumped = false;
 bool g_wide_input_block_dumped = false;
@@ -619,6 +642,12 @@ const char* KnownGuidLabel(REFGUID guid) {
     if (IsEqualGuidValue(guid, kIID_DirectInput8W)) {
         return "IID_IDirectInput8W";
     }
+    if (IsEqualGuidValue(guid, kIID_DirectInputDevice8A)) {
+        return "IID_IDirectInputDevice8A";
+    }
+    if (IsEqualGuidValue(guid, kIID_DirectInputDevice8W)) {
+        return "IID_IDirectInputDevice8W";
+    }
     if (IsEqualGuidValue(guid, kGUID_SysMouse)) {
         return "GUID_SysMouse";
     }
@@ -639,6 +668,19 @@ std::string FormatHex32(DWORD value) {
     char buffer[16] = {};
     std::snprintf(buffer, sizeof(buffer), "0x%08lX", static_cast<unsigned long>(value));
     return buffer;
+}
+
+bool TryStartSummaryWindow(DWORD* last_summary_tick, DWORD now) {
+    auto* atomic_tick = reinterpret_cast<volatile LONG*>(last_summary_tick);
+    const DWORD previous = static_cast<DWORD>(InterlockedCompareExchange(atomic_tick, 0, 0));
+    if (previous != 0 && now - previous < 1000) {
+        return false;
+    }
+
+    return InterlockedCompareExchange(
+               atomic_tick,
+               static_cast<LONG>(now),
+               static_cast<LONG>(previous)) == static_cast<LONG>(previous);
 }
 
 std::string DescribeWaitTimeout(DWORD timeout) {
@@ -969,7 +1011,9 @@ bool TryWaitForMtWorkerState(
     std::uintptr_t edi_value,
     std::uintptr_t ebp_value,
     void* caller) {
-    if (!g_config.optimize_mt_worker_wait || g_wait_on_address == nullptr) {
+    if (!g_supported_game_build ||
+        !g_config.optimize_mt_worker_wait ||
+        g_wait_on_address == nullptr) {
         return false;
     }
 
@@ -1025,7 +1069,9 @@ bool TrySleepForMtWorkerState4Timer(
     std::uintptr_t edi_value,
     std::uintptr_t ebp_value,
     void* caller) {
-    if (!g_config.optimize_mt_worker_state4_timer_wait || !g_timer.ready) {
+    if (!g_supported_game_build ||
+        !g_config.optimize_mt_worker_state4_timer_wait ||
+        !g_timer.ready) {
         return false;
     }
 
@@ -1072,6 +1118,7 @@ bool TrySleepForMtWorkerState4Timer(
         return false;
     }
 
+    // Use the same replacement time source as the hooked game path; this helper does not call Sleep.
     const DWORD now_ms = HookedTimeGetTime();
     const DWORD elapsed_ms = now_ms - static_cast<DWORD>(start_tick);
     if (duration_ms <= elapsed_ms + 1u) {
@@ -1114,7 +1161,9 @@ bool TrySleepForMtWorkerState4Timer(
 bool TryWaitForMtWorkerState9(
     std::uintptr_t ebx_value,
     void* caller) {
-    if (!g_config.optimize_mt_worker_state9_wait || g_wait_on_address == nullptr) {
+    if (!g_supported_game_build ||
+        !g_config.optimize_mt_worker_state9_wait ||
+        g_wait_on_address == nullptr) {
         return false;
     }
 
@@ -1543,13 +1592,88 @@ std::uintptr_t GetCallerRva(void* return_address) {
     return caller - module;
 }
 
+bool IsSupportedGameBuild(HMODULE main_module) {
+    if (main_module == nullptr) {
+        return false;
+    }
+
+    WORD machine = 0;
+    DWORD time_date_stamp = 0;
+    DWORD size_of_image = 0;
+
+    IMAGE_DOS_HEADER dos_header{};
+    SIZE_T bytes_read = 0;
+    if (ReadProcessMemory(
+            GetCurrentProcess(),
+            main_module,
+            &dos_header,
+            sizeof(dos_header),
+            &bytes_read) == FALSE ||
+        bytes_read != sizeof(dos_header) ||
+        dos_header.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos_header.e_lfanew <= 0 ||
+        dos_header.e_lfanew > 0x100000) {
+        return false;
+    }
+
+    IMAGE_NT_HEADERS32 nt_headers{};
+    bytes_read = 0;
+    const auto* nt_address = reinterpret_cast<const unsigned char*>(main_module) +
+        dos_header.e_lfanew;
+    if (ReadProcessMemory(
+            GetCurrentProcess(),
+            nt_address,
+            &nt_headers,
+            sizeof(nt_headers),
+            &bytes_read) == FALSE ||
+        bytes_read != sizeof(nt_headers) ||
+        nt_headers.Signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+
+    machine = nt_headers.FileHeader.Machine;
+    time_date_stamp = nt_headers.FileHeader.TimeDateStamp;
+    size_of_image = nt_headers.OptionalHeader.SizeOfImage;
+
+    wchar_t module_path[MAX_PATH] = {};
+    ULONGLONG file_size = 0;
+    if (GetModuleFileNameW(main_module, module_path, static_cast<DWORD>(_countof(module_path))) != 0) {
+        WIN32_FILE_ATTRIBUTE_DATA file_data{};
+        if (GetFileAttributesExW(module_path, GetFileExInfoStandard, &file_data) != FALSE) {
+            ULARGE_INTEGER size{};
+            size.HighPart = file_data.nFileSizeHigh;
+            size.LowPart = file_data.nFileSizeLow;
+            file_size = size.QuadPart;
+        }
+    }
+
+    const bool matches =
+        machine == kSupportedGameMachine &&
+        time_date_stamp == kSupportedGameTimeDateStamp &&
+        size_of_image == kSupportedGameSizeOfImage &&
+        file_size == kSupportedGameFileSize;
+    if (!matches) {
+        Log(
+            "Unsupported game executable build: machine=%04X timestamp=%s image=%s size=%llu. Hard-coded RVA optimizations will stay disabled.",
+            static_cast<unsigned int>(machine),
+            FormatHex32(time_date_stamp).c_str(),
+            FormatHex32(size_of_image).c_str(),
+            static_cast<unsigned long long>(file_size));
+    }
+    return matches;
+}
+
 std::string DescribeCodeWindow(const void* center, std::size_t before = 12, std::size_t after = 20) {
     if (center == nullptr) {
         return "<unknown>";
     }
 
     std::string result;
-    const auto* bytes = reinterpret_cast<const unsigned char*>(center) - before;
+    const auto center_address = reinterpret_cast<std::uintptr_t>(center);
+    if (center_address < before) {
+        return "<unreadable>";
+    }
+    const auto* bytes = reinterpret_cast<const unsigned char*>(center_address - before);
     MEMORY_BASIC_INFORMATION memory_info{};
     if (VirtualQuery(bytes, &memory_info, sizeof(memory_info)) == 0) {
         return "<unreadable>";
@@ -1562,55 +1686,85 @@ std::string DescribeCodeWindow(const void* center, std::size_t before = 12, std:
         return "<unreadable>";
     }
 
-    for (std::size_t index = 0; index < before + after; ++index) {
+    const std::size_t byte_count = before + after;
+    std::string buffer(byte_count, '\0');
+    SIZE_T bytes_read = 0;
+    if (ReadProcessMemory(
+            GetCurrentProcess(),
+            bytes,
+            buffer.data(),
+            buffer.size(),
+            &bytes_read) == FALSE ||
+        bytes_read == 0) {
+        return "<unreadable>";
+    }
+
+    for (std::size_t index = 0; index < bytes_read; ++index) {
         if (index == before) {
             result += "| ";
         }
 
         char byte_text[8] = {};
-        std::snprintf(byte_text, sizeof(byte_text), "%02X ", bytes[index]);
+        std::snprintf(
+            byte_text,
+            sizeof(byte_text),
+            "%02X ",
+            static_cast<unsigned char>(buffer[index]));
         result += byte_text;
+    }
+    if (bytes_read < byte_count) {
+        result += "<truncated>";
     }
 
     return result;
 }
 
 bool IsOptimizedGetCursorPosCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kGetCursorPosCallerA || caller_rva == kGetCursorPosCallerB;
+    return g_supported_game_build &&
+           (caller_rva == kGetCursorPosCallerA || caller_rva == kGetCursorPosCallerB);
 }
 
 bool IsOptimizedGetClientRectCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kGetClientRectCallerA || caller_rva == kGetClientRectCallerB;
+    return g_supported_game_build &&
+           (caller_rva == kGetClientRectCallerA || caller_rva == kGetClientRectCallerB);
 }
 
 bool IsOptimizedThreadJoinCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kThreadJoinGetExitCodeCallerRva ||
-           caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayA ||
-           caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayB ||
-           caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayC;
+    return g_supported_game_build &&
+           (caller_rva == kThreadJoinGetExitCodeCallerRva ||
+            caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayA ||
+            caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayB ||
+            caller_rva == kThreadJoinGetExitCodeCallerRvaGameplayC);
 }
 
 bool IsThreadJoinSleepCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kThreadJoinSleepCallerRva ||
-           caller_rva == kThreadJoinSleepCallerRvaGameplayA ||
-           caller_rva == kThreadJoinSleepCallerRvaGameplayB ||
-           caller_rva == kThreadJoinSleepCallerRvaGameplayC;
+    return g_supported_game_build &&
+           (caller_rva == kThreadJoinSleepCallerRva ||
+            caller_rva == kThreadJoinSleepCallerRvaGameplayA ||
+            caller_rva == kThreadJoinSleepCallerRvaGameplayB ||
+            caller_rva == kThreadJoinSleepCallerRvaGameplayC);
 }
 
 bool IsAlertableSleepExIoCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kAlertableSleepExIoCallerRvaA ||
-           caller_rva == kAlertableSleepExIoCallerRvaB ||
-           caller_rva == kAlertableSleepExIoCallerRvaC ||
-           caller_rva == kAlertableSleepExIoCallerRvaD ||
-           caller_rva == kAlertableSleepExIoCallerRvaE;
+    return g_supported_game_build &&
+           (caller_rva == kAlertableSleepExIoCallerRvaA ||
+            caller_rva == kAlertableSleepExIoCallerRvaB ||
+            caller_rva == kAlertableSleepExIoCallerRvaC ||
+            caller_rva == kAlertableSleepExIoCallerRvaD ||
+            caller_rva == kAlertableSleepExIoCallerRvaE);
 }
 
 bool IsStreamRetrySleepCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kStreamRetrySleepCallerRvaA ||
-           caller_rva == kStreamRetrySleepCallerRvaB;
+    return g_supported_game_build &&
+           (caller_rva == kStreamRetrySleepCallerRvaA ||
+            caller_rva == kStreamRetrySleepCallerRvaB);
 }
 
 bool IsLegacyDelayPrecisionCaller(std::uintptr_t caller_rva, DWORD milliseconds) {
+    if (!g_supported_game_build) {
+        return false;
+    }
+
     switch (caller_rva) {
     case kLegacyDelaySleepCallerRva17:
         return milliseconds == 17;
@@ -1626,6 +1780,10 @@ bool IsLegacyDelayPrecisionCaller(std::uintptr_t caller_rva, DWORD milliseconds)
 }
 
 StreamRetryBackoffEntry* GetStreamRetryBackoffEntry(std::uintptr_t caller_rva) {
+    if (!g_supported_game_build) {
+        return nullptr;
+    }
+
     if (caller_rva == kStreamRetrySleepCallerRvaA) {
         return &g_stream_retry_backoff.caller_a;
     }
@@ -1636,11 +1794,12 @@ StreamRetryBackoffEntry* GetStreamRetryBackoffEntry(std::uintptr_t caller_rva) {
 }
 
 bool IsOptimizedScreenToClientCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kScreenToClientCallerA || caller_rva == kScreenToClientCallerB;
+    return g_supported_game_build &&
+           (caller_rva == kScreenToClientCallerA || caller_rva == kScreenToClientCallerB);
 }
 
 bool IsOptimizedClientToScreenCaller(std::uintptr_t caller_rva) {
-    return caller_rva == kClientToScreenCallerA;
+    return g_supported_game_build && caller_rva == kClientToScreenCallerA;
 }
 
 bool DumpInputBlock(
@@ -1718,7 +1877,10 @@ bool DumpInputBlock(
 }
 
 void MaybeDumpHotInputBlock() {
-    if (!g_config.dump_hot_input_block || g_hot_input_block_dumped || g_data_dir.empty()) {
+    if (!g_config.dump_hot_input_block ||
+        !g_supported_game_build ||
+        g_hot_input_block_dumped ||
+        g_data_dir.empty()) {
         return;
     }
 
@@ -1731,7 +1893,10 @@ void MaybeDumpHotInputBlock() {
 }
 
 void MaybeDumpWideInputBlock() {
-    if (!g_config.dump_wide_input_block || g_wide_input_block_dumped || g_data_dir.empty()) {
+    if (!g_config.dump_wide_input_block ||
+        !g_supported_game_build ||
+        g_wide_input_block_dumped ||
+        g_data_dir.empty()) {
         return;
     }
 
@@ -1760,7 +1925,9 @@ DWORD GetMainModuleImageSize() {
 }
 
 void MaybeDumpRuntimeQfpsPointerRefs() {
-    if (!g_config.log_input_traffic || g_runtime_qfps_pointer_refs_dumped) {
+    if (!g_config.log_input_traffic ||
+        !g_supported_game_build ||
+        g_runtime_qfps_pointer_refs_dumped) {
         return;
     }
 
@@ -1867,7 +2034,10 @@ bool DumpRuntimeCodeBlock(
 }
 
 void MaybeDumpRuntimeQfpsCallChainBlocks() {
-    if (!g_config.log_input_traffic || g_runtime_qfps_call_chain_dumped || g_data_dir.empty()) {
+    if (!g_config.log_input_traffic ||
+        !g_supported_game_build ||
+        g_runtime_qfps_call_chain_dumped ||
+        g_data_dir.empty()) {
         return;
     }
 
@@ -1892,7 +2062,9 @@ void MaybeDumpRuntimeQfpsCallChainBlocks() {
 }
 
 void MaybeLogRuntimeQfpsLiveObjects() {
-    if (!g_config.log_input_traffic || g_runtime_qfps_live_objects_logged) {
+    if (!g_config.log_input_traffic ||
+        !g_supported_game_build ||
+        g_runtime_qfps_live_objects_logged) {
         return;
     }
 
@@ -1967,7 +2139,9 @@ bool TryWriteDword(std::uintptr_t address, DWORD value) {
 }
 
 void MaybeApplyQfpsMouseCtrlLagPatch(std::uintptr_t caller_rva) {
-    if (!g_config.disable_qfps_mouse_ctrl_lag || !IsOptimizedGetCursorPosCaller(caller_rva)) {
+    if (!g_config.disable_qfps_mouse_ctrl_lag ||
+        !g_supported_game_build ||
+        !IsOptimizedGetCursorPosCaller(caller_rva)) {
         return;
     }
 
@@ -2130,6 +2304,7 @@ void RecordMouseDeviceState(const DIMOUSESTATE2& state) {
 
 bool CanUseIdleGetCursorPosCache(std::uintptr_t caller_rva) {
     if (!g_config.optimize_idle_get_cursor_pos ||
+        !g_supported_game_build ||
         caller_rva != kGetCursorPosCallerA ||
         !g_timer.ready ||
         !g_input_probe.cached_get_cursor_valid ||
@@ -2249,7 +2424,8 @@ void MaybeLogHotInputStack(const char* tag) {
 
 bool ShouldWrapDirectInputDevice(REFGUID guid) {
     if (IsEqualGuidValue(guid, kGUID_SysMouse)) {
-        return g_config.log_input_traffic || g_config.optimize_idle_get_cursor_pos;
+        return g_config.log_input_traffic ||
+               (g_supported_game_build && g_config.optimize_idle_get_cursor_pos);
     }
 
     return g_config.log_input_traffic && IsEqualGuidValue(guid, kGUID_SysKeyboard);
@@ -2293,12 +2469,9 @@ void MaybeLogD3DSummary() {
     }
 
     const DWORD now = GetTickCount();
-    if (g_d3d_probe.last_summary_tick != 0 &&
-        now - g_d3d_probe.last_summary_tick < 1000) {
+    if (!TryStartSummaryWindow(&g_d3d_probe.last_summary_tick, now)) {
         return;
     }
-
-    g_d3d_probe.last_summary_tick = now;
     const LONG direct3d_create9_calls =
         InterlockedExchange(&g_d3d_probe.direct3d_create9_calls, 0);
     const LONG create_device_calls =
@@ -2354,12 +2527,9 @@ void MaybeLogTimingSummary() {
     }
 
     const DWORD now = GetTickCount();
-    if (g_timing_probe.last_summary_tick != 0 &&
-        now - g_timing_probe.last_summary_tick < 1000) {
+    if (!TryStartSummaryWindow(&g_timing_probe.last_summary_tick, now)) {
         return;
     }
-
-    g_timing_probe.last_summary_tick = now;
 
     const LONG sleep_calls = InterlockedExchange(&g_timing_probe.sleep_calls, 0);
     const LONG forwarded_sleep_calls =
@@ -2609,12 +2779,9 @@ void MaybeLogInputSummary() {
     }
 
     const DWORD now = GetTickCount();
-    if (g_input_probe.last_summary_tick != 0 &&
-        now - g_input_probe.last_summary_tick < 1000) {
+    if (!TryStartSummaryWindow(&g_input_probe.last_summary_tick, now)) {
         return;
     }
-
-    g_input_probe.last_summary_tick = now;
     const LONG get_cursor_pos_calls = InterlockedExchange(&g_input_probe.get_cursor_pos_calls, 0);
     const LONG forwarded_get_cursor_pos_calls =
         InterlockedExchange(&g_input_probe.forwarded_get_cursor_pos_calls, 0);
@@ -2911,7 +3078,7 @@ public:
             } else if (FAILED(result)) {
                 g_input_probe.last_mouse_sample_valid = false;
             }
-            if (caller_rva == 0x0082798A) {
+            if (g_supported_game_build && caller_rva == 0x0082798A) {
                 MaybeLogHotInputStack("DI8A.Mouse.GetDeviceState");
             }
         }
@@ -3184,6 +3351,428 @@ private:
     bool track_mouse_ = false;
 };
 
+class DirectInputDevice8WProxy final : public IDirectInputDevice8W {
+public:
+    DirectInputDevice8WProxy(
+        IDirectInputDevice8W* inner,
+        std::string device_name,
+        bool track_mouse)
+        : inner_(inner), device_name_(std::move(device_name)), track_mouse_(track_mouse) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        if (IsEqualGuidValue(riid, kIID_IUnknown) ||
+            IsEqualGuidValue(riid, kIID_DirectInputDevice8W)) {
+            *object = static_cast<IDirectInputDevice8W*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return inner_->QueryInterface(riid, object);
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return inner_->AddRef();
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG ref_count = inner_->Release();
+        if (ref_count == 0) {
+            delete this;
+        }
+        return ref_count;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetCapabilities(LPDIDEVCAPS caps) override {
+        return inner_->GetCapabilities(caps);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumObjects(
+        LPDIENUMDEVICEOBJECTSCALLBACKW callback,
+        LPVOID context,
+        DWORD flags) override {
+        return inner_->EnumObjects(callback, context, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetProperty(REFGUID guid, LPDIPROPHEADER header) override {
+        return inner_->GetProperty(guid, header);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetProperty(REFGUID guid, LPCDIPROPHEADER header) override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->SetProperty(guid, header);
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_set_property_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string property_name = DescribePropertyGuid(guid);
+        const std::string property_value = DescribePropertyHeader(header);
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".SetProperty|" + property_name + "|" + property_value +
+            "|caller=" + caller_description + "|" + DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::SetProperty(%s, %s) caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                property_name.c_str(),
+                property_value.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Acquire() override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->Acquire();
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_acquire_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".Acquire|caller=" + caller_description + "|" +
+            DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::Acquire caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Unacquire() override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->Unacquire();
+        if (track_mouse_) {
+            g_input_probe.last_mouse_sample_valid = false;
+        }
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_unacquire_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".Unacquire|caller=" + caller_description + "|" +
+            DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::Unacquire caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDeviceState(DWORD size, LPVOID data) override {
+        void* caller = _ReturnAddress();
+        const std::uintptr_t caller_rva = GetCallerRva(caller);
+        const HRESULT result = inner_->GetDeviceState(size, data);
+        if (track_mouse_) {
+            if (SUCCEEDED(result) && data != nullptr && size >= sizeof(DIMOUSESTATE2)) {
+                RecordMouseDeviceState(*reinterpret_cast<const DIMOUSESTATE2*>(data));
+            } else if (FAILED(result)) {
+                g_input_probe.last_mouse_sample_valid = false;
+            }
+            if (g_supported_game_build && caller_rva == 0x0082798A) {
+                MaybeLogHotInputStack("DI8W.Mouse.GetDeviceState");
+            }
+        }
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_get_device_state_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".GetDeviceState|" + std::to_string(size) + "|caller=" +
+            caller_description + "|" + DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::GetDeviceState(size=%lu) caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                static_cast<unsigned long>(size),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDeviceData(
+        DWORD object_data_size,
+        LPDIDEVICEOBJECTDATA object_data,
+        LPDWORD in_out_count,
+        DWORD flags) override {
+        void* caller = _ReturnAddress();
+        const DWORD requested_count = in_out_count != nullptr ? *in_out_count : 0;
+        const HRESULT result =
+            inner_->GetDeviceData(object_data_size, object_data, in_out_count, flags);
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_get_device_data_calls);
+            MaybeLogInputSummary();
+        }
+
+        const DWORD actual_count = in_out_count != nullptr ? *in_out_count : 0;
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".GetDeviceData|" + std::to_string(object_data_size) + "|" +
+            std::to_string(requested_count) + "|" + std::to_string(actual_count) + "|" +
+            FormatHex32(flags) + "|caller=" + caller_description + "|" +
+            DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::GetDeviceData(obj=%lu requested=%lu actual=%lu flags=%s) caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                static_cast<unsigned long>(object_data_size),
+                static_cast<unsigned long>(requested_count),
+                static_cast<unsigned long>(actual_count),
+                FormatHex32(flags).c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetDataFormat(LPCDIDATAFORMAT format) override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->SetDataFormat(format);
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_set_data_format_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string format_description = DescribeDataFormat(format);
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".SetDataFormat|" + format_description + "|caller=" +
+            caller_description + "|" + DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::SetDataFormat(%s) caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                format_description.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetEventNotification(HANDLE event) override {
+        return inner_->SetEventNotification(event);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND window, DWORD flags) override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->SetCooperativeLevel(window, flags);
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_set_cooperative_level_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string cooperative_flags = DescribeCooperativeFlags(flags);
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".SetCooperativeLevel|" + cooperative_flags + "|caller=" +
+            caller_description + "|" + DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::SetCooperativeLevel(%s) caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                cooperative_flags.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetObjectInfo(
+        LPDIDEVICEOBJECTINSTANCEW object,
+        DWORD object_id,
+        DWORD flags) override {
+        return inner_->GetObjectInfo(object, object_id, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDeviceInfo(LPDIDEVICEINSTANCEW instance) override {
+        return inner_->GetDeviceInfo(instance);
+    }
+
+    HRESULT STDMETHODCALLTYPE RunControlPanel(HWND window, DWORD flags) override {
+        return inner_->RunControlPanel(window, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE Initialize(
+        HINSTANCE instance,
+        DWORD version,
+        REFGUID guid) override {
+        return inner_->Initialize(instance, version, guid);
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateEffect(
+        REFGUID effect_guid,
+        LPCDIEFFECT effect,
+        LPDIRECTINPUTEFFECT* out_effect,
+        LPUNKNOWN outer) override {
+        return inner_->CreateEffect(effect_guid, effect, out_effect, outer);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumEffects(
+        LPDIENUMEFFECTSCALLBACKW callback,
+        LPVOID context,
+        DWORD effect_type) override {
+        return inner_->EnumEffects(callback, context, effect_type);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetEffectInfo(
+        LPDIEFFECTINFOW effect_info,
+        REFGUID effect_guid) override {
+        return inner_->GetEffectInfo(effect_info, effect_guid);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetForceFeedbackState(LPDWORD state) override {
+        return inner_->GetForceFeedbackState(state);
+    }
+
+    HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD flags) override {
+        return inner_->SendForceFeedbackCommand(flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumCreatedEffectObjects(
+        LPDIENUMCREATEDEFFECTOBJECTSCALLBACK callback,
+        LPVOID context,
+        DWORD flags) override {
+        return inner_->EnumCreatedEffectObjects(callback, context, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE Escape(LPDIEFFESCAPE escape) override {
+        return inner_->Escape(escape);
+    }
+
+    HRESULT STDMETHODCALLTYPE Poll() override {
+        void* caller = _ReturnAddress();
+        const HRESULT result = inner_->Poll();
+        if (!g_config.log_input_traffic) {
+            return result;
+        }
+
+        if (track_mouse_) {
+            InterlockedIncrement(&g_input_probe.mouse_poll_calls);
+            MaybeLogInputSummary();
+        }
+
+        const std::string caller_description = DescribeCallerAddress(caller);
+        const std::string signature =
+            "DI8W." + device_name_ + ".Poll|caller=" + caller_description + "|" +
+            DescribeDirectInputResult(result);
+        if (RememberInputEvent(signature)) {
+            Log(
+                "%s::Poll caller=%s bytes=%s hr=%s",
+                device_name_.c_str(),
+                caller_description.c_str(),
+                DescribeCodeWindow(caller).c_str(),
+                DescribeDirectInputResult(result).c_str());
+        }
+
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE SendDeviceData(
+        DWORD object_data_size,
+        LPCDIDEVICEOBJECTDATA object_data,
+        LPDWORD in_out_count,
+        DWORD flags) override {
+        return inner_->SendDeviceData(object_data_size, object_data, in_out_count, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumEffectsInFile(
+        LPCWSTR file_name,
+        LPDIENUMEFFECTSINFILECALLBACK callback,
+        LPVOID context,
+        DWORD flags) override {
+        return inner_->EnumEffectsInFile(file_name, callback, context, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE WriteEffectToFile(
+        LPCWSTR file_name,
+        DWORD entries,
+        LPDIFILEEFFECT effects,
+        DWORD flags) override {
+        return inner_->WriteEffectToFile(file_name, entries, effects, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE BuildActionMap(
+        LPDIACTIONFORMATW action_format,
+        LPCWSTR user_name,
+        DWORD flags) override {
+        return inner_->BuildActionMap(action_format, user_name, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetActionMap(
+        LPDIACTIONFORMATW action_format,
+        LPCWSTR user_name,
+        DWORD flags) override {
+        return inner_->SetActionMap(action_format, user_name, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetImageInfo(LPDIDEVICEIMAGEINFOHEADERW image_info) override {
+        return inner_->GetImageInfo(image_info);
+    }
+
+private:
+    IDirectInputDevice8W* inner_ = nullptr;
+    std::string device_name_;
+    bool track_mouse_ = false;
+};
+
 class DirectInput8AProxy final : public IDirectInput8A {
 public:
     explicit DirectInput8AProxy(IDirectInput8A* inner) : inner_(inner) {}
@@ -3324,13 +3913,29 @@ public:
         REFGUID rguid,
         LPDIRECTINPUTDEVICE8W* device,
         LPUNKNOWN outer) override {
+        const HRESULT result = inner_->CreateDevice(rguid, device, outer);
         if (g_config.log_input_traffic) {
             const std::string guid = DescribeGuid(rguid);
             if (RememberInputEvent("DI8W.CreateDevice|" + guid)) {
-                Log("DirectInput8W::CreateDevice(%s)", guid.c_str());
+                Log(
+                    "DirectInput8W::CreateDevice(%s) hr=%s",
+                    guid.c_str(),
+                    DescribeDirectInputResult(result).c_str());
             }
         }
-        return inner_->CreateDevice(rguid, device, outer);
+
+        if (SUCCEEDED(result) &&
+            device != nullptr &&
+            *device != nullptr &&
+            ShouldWrapDirectInputDevice(rguid)) {
+            const bool track_mouse = IsEqualGuidValue(rguid, kGUID_SysMouse);
+            *device = new DirectInputDevice8WProxy(
+                *device,
+                DescribeGuid(rguid),
+                track_mouse);
+        }
+
+        return result;
     }
 
     HRESULT STDMETHODCALLTYPE EnumDevices(
@@ -4046,8 +4651,13 @@ void LoadConfig() {
     g_config.high_precision_time_get_time =
         read_bool(L"Timing", L"HighPrecisionTimeGetTime", true);
     g_config.precise_short_sleep = read_bool(L"Timing", L"PreciseShortSleep", true);
-    g_config.short_sleep_threshold_ms =
-        static_cast<DWORD>(read_int(L"Timing", L"ShortSleepThresholdMs", 2));
+    int short_sleep_threshold_ms = read_int(L"Timing", L"ShortSleepThresholdMs", 2);
+    if (short_sleep_threshold_ms < 0) {
+        short_sleep_threshold_ms = 0;
+    } else if (short_sleep_threshold_ms > 16) {
+        short_sleep_threshold_ms = 16;
+    }
+    g_config.short_sleep_threshold_ms = static_cast<DWORD>(short_sleep_threshold_ms);
     g_config.crash_dumps = read_bool(L"General", L"CrashDumps", true);
     g_config.protect_unhandled_exception_filter =
         read_bool(L"General", L"ProtectUnhandledExceptionFilter", true);
@@ -4126,27 +4736,33 @@ void PreciseSleepSpin(DWORD milliseconds) {
     bool used_waitable_timer = false;
 
     if (milliseconds != 0) {
-        if (g_precise_sleep_timer == nullptr) {
-            if (!g_precise_sleep_timer_attempted_high_res) {
-                g_precise_sleep_timer = CreateWaitableTimerExW(
+        if (g_precise_sleep_timer.handle == nullptr) {
+            if (!g_precise_sleep_timer.attempted_high_res) {
+                g_precise_sleep_timer.handle = CreateWaitableTimerExW(
                     nullptr,
                     nullptr,
                     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                     TIMER_MODIFY_STATE | SYNCHRONIZE);
-                g_precise_sleep_timer_attempted_high_res = true;
+                g_precise_sleep_timer.attempted_high_res = true;
             }
-            if (g_precise_sleep_timer == nullptr) {
-                g_precise_sleep_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+            if (g_precise_sleep_timer.handle == nullptr) {
+                g_precise_sleep_timer.handle = CreateWaitableTimerW(nullptr, FALSE, nullptr);
             }
         }
 
-        if (g_precise_sleep_timer != nullptr) {
+        if (g_precise_sleep_timer.handle != nullptr) {
             const auto wait_us = static_cast<std::uint64_t>(milliseconds) * 1000ULL;
             const auto timer_wait_us = wait_us > 200 ? wait_us - 200 : wait_us;
             LARGE_INTEGER due_time{};
             due_time.QuadPart = -static_cast<LONGLONG>(timer_wait_us * 10ULL);
-            if (SetWaitableTimer(g_precise_sleep_timer, &due_time, 0, nullptr, nullptr, FALSE)) {
-                WaitForSingleObjectEx(g_precise_sleep_timer, INFINITE, FALSE);
+            if (SetWaitableTimer(
+                    g_precise_sleep_timer.handle,
+                    &due_time,
+                    0,
+                    nullptr,
+                    nullptr,
+                    FALSE)) {
+                WaitForSingleObjectEx(g_precise_sleep_timer.handle, INFINITE, FALSE);
                 used_waitable_timer = true;
             }
         }
@@ -4240,6 +4856,8 @@ void SleepForStreamRetryBackoff(std::uintptr_t caller_rva, void* caller) {
     }
 }
 
+// The x86 hook stub captures preserved registers before calling this dispatcher.
+// Several game wait loops keep the worker object pointer in those registers across Sleep(1).
 void __cdecl HookedSleepImpl(
     DWORD milliseconds,
     std::uintptr_t ebx_value,
@@ -4253,18 +4871,21 @@ void __cdecl HookedSleepImpl(
 
     const std::uintptr_t caller_rva = GetCallerRva(caller);
     const bool use_ui_thread_message_wait =
+        g_supported_game_build &&
         g_config.optimize_ui_thread_message_wait &&
         milliseconds == 1 &&
         caller_rva == kUiThreadSleepCallerRva &&
         g_original_msg_wait_for_multiple_objects_ex != nullptr;
     const bool use_queue_worker_yield =
         !use_ui_thread_message_wait &&
+        g_supported_game_build &&
         g_config.optimize_queue_worker_yield &&
         milliseconds == 1 &&
         caller_rva == kQueueWorkerYieldSleepCallerRva;
     const bool use_pacing_sleep_precision =
         !use_ui_thread_message_wait &&
         !use_queue_worker_yield &&
+        g_supported_game_build &&
         g_config.optimize_pacing_sleep_precision &&
         caller_rva == kPacingSleepCallerRva &&
         milliseconds != 0 &&
@@ -4310,6 +4931,7 @@ void __cdecl HookedSleepImpl(
         !use_stream_retry_backoff &&
         !use_thread_join_yield &&
         !use_stream_retry_yield &&
+        g_supported_game_build &&
         milliseconds == 1 &&
         caller_rva == kMtWorkerSleepCallerRva &&
         TrySleepForMtWorkerState4Timer(ebx_value, esi_value, edi_value, ebp_value, caller);
@@ -4322,6 +4944,7 @@ void __cdecl HookedSleepImpl(
         !use_thread_join_yield &&
         !use_stream_retry_yield &&
         !use_mt_worker_state4_timer_wait &&
+        g_supported_game_build &&
         caller_rva == kMtWorkerState9SleepCallerRva &&
         milliseconds == 10 &&
         TryWaitForMtWorkerState9(ebx_value, caller);
@@ -4335,6 +4958,7 @@ void __cdecl HookedSleepImpl(
         !use_stream_retry_yield &&
         !use_mt_worker_state4_timer_wait &&
         !use_mt_worker_state9_wait &&
+        g_supported_game_build &&
         milliseconds == 1 &&
         caller_rva == kMtWorkerSleepCallerRva &&
         TryWaitForMtWorkerState(ebx_value, esi_value, edi_value, ebp_value, caller);
@@ -4409,7 +5033,8 @@ void __cdecl HookedSleepImpl(
                 caller_description.c_str(),
                 DescribeCodeWindow(caller).c_str());
         }
-        if (caller_rva == kMtWorkerSleepCallerRva &&
+        if (g_supported_game_build &&
+            caller_rva == kMtWorkerSleepCallerRva &&
             !use_mt_worker_state4_timer_wait &&
             !use_mt_worker_wait) {
             MaybeLogMtWorkerHotSleepState(
@@ -4644,7 +5269,8 @@ BOOL WINAPI HookedGetExitCodeThread(HANDLE thread, LPDWORD exit_code) {
 UINT WINAPI HookedTimeBeginPeriod(UINT period) {
     void* caller = _ReturnAddress();
     const std::uintptr_t caller_rva = GetCallerRva(caller);
-    if (g_config.optimize_worker_state_wait &&
+    if (g_supported_game_build &&
+        g_config.optimize_worker_state_wait &&
         g_config.optimize_ui_thread_timer_period &&
         period == 1 &&
         caller_rva == kUiThreadTimeBeginCallerRva) {
@@ -4695,7 +5321,8 @@ UINT WINAPI HookedTimeBeginPeriod(UINT period) {
 UINT WINAPI HookedTimeEndPeriod(UINT period) {
     void* caller = _ReturnAddress();
     const std::uintptr_t caller_rva = GetCallerRva(caller);
-    if (g_config.optimize_worker_state_wait &&
+    if (g_supported_game_build &&
+        g_config.optimize_worker_state_wait &&
         g_config.optimize_ui_thread_timer_period &&
         period == 1 &&
         caller_rva == kUiThreadTimeEndCallerRva) {
@@ -5856,7 +6483,8 @@ HRESULT WINAPI HookedDirectInput8Create(
     }
 
     const bool should_wrap =
-        g_config.log_input_traffic || g_config.optimize_idle_get_cursor_pos;
+        g_config.log_input_traffic ||
+        (g_supported_game_build && g_config.optimize_idle_get_cursor_pos);
     const std::string interface_name = DescribeGuid(interface_id);
     if (g_config.log_input_traffic &&
         RememberInputEvent("DirectInput8Create|" + interface_name)) {
@@ -6249,9 +6877,15 @@ void InstallHooks() {
 
     ResolveOriginalFunctions();
     InitializeTimerState();
+    g_supported_game_build = IsSupportedGameBuild(main_module);
+    if (g_supported_game_build) {
+        Log("Validated supported Resident Evil Revelations 2 executable build.");
+    }
 
     if (g_config.optimize_worker_state_wait) {
-        if (g_wait_on_address == nullptr || g_wake_by_address_all == nullptr) {
+        if (!g_supported_game_build) {
+            Log("Worker-state wait optimization disabled: unsupported game executable build.");
+        } else if (g_wait_on_address == nullptr || g_wake_by_address_all == nullptr) {
             Log("Worker-state wait optimization unavailable: WaitOnAddress/WakeByAddressAll missing.");
         } else {
             auto* base = reinterpret_cast<std::uint8_t*>(main_module);
@@ -6307,7 +6941,9 @@ void InstallHooks() {
     }
 
     if (g_config.optimize_mt_worker_wait) {
-        if (g_wait_on_address == nullptr || g_wake_by_address_all == nullptr) {
+        if (!g_supported_game_build) {
+            Log("MT worker wait optimization disabled: unsupported game executable build.");
+        } else if (g_wait_on_address == nullptr || g_wake_by_address_all == nullptr) {
             Log("MT worker wait optimization unavailable: WaitOnAddress/WakeByAddressAll missing.");
         } else {
             auto* base = reinterpret_cast<std::uint8_t*>(main_module);
@@ -6360,10 +6996,21 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.precise_short_sleep ||
-        g_config.optimize_mt_worker_wait ||
-        g_config.optimize_mt_worker_state4_timer_wait ||
-        g_config.optimize_stream_retry_yield) {
+    const bool needs_sleep_hook =
+        g_config.log_timing_traffic ||
+        g_config.precise_short_sleep ||
+        (g_supported_game_build &&
+            (g_config.optimize_ui_thread_message_wait ||
+             g_config.optimize_queue_worker_yield ||
+             g_config.optimize_pacing_sleep_precision ||
+             g_config.optimize_legacy_delay_precision ||
+             g_config.optimize_stream_retry_backoff ||
+             g_config.optimize_stream_retry_yield ||
+             g_config.optimize_thread_join_wait ||
+             g_config.optimize_mt_worker_wait ||
+             g_config.optimize_mt_worker_state4_timer_wait ||
+             g_config.optimize_mt_worker_state9_wait));
+    if (needs_sleep_hook) {
         void* original_sleep = reinterpret_cast<void*>(g_original_sleep);
         if (PatchIAT(main_module, "KERNEL32.dll", "Sleep", HookedSleep, &original_sleep)) {
             g_original_sleep = reinterpret_cast<SleepFn>(original_sleep);
@@ -6373,7 +7020,7 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.precise_short_sleep) {
+    if (g_config.log_timing_traffic || g_config.precise_short_sleep) {
         void* original_sleep_ex = reinterpret_cast<void*>(g_original_sleep_ex);
         if (PatchIAT(main_module, "KERNEL32.dll", "SleepEx", HookedSleepEx, &original_sleep_ex)) {
             g_original_sleep_ex = reinterpret_cast<SleepExFn>(original_sleep_ex);
@@ -6385,7 +7032,9 @@ void InstallHooks() {
 
     if (g_config.optimize_thread_join_wait) {
         g_thread_join_hook_installed = false;
-        if (g_original_get_exit_code_thread == nullptr ||
+        if (!g_supported_game_build) {
+            Log("Thread-join wait optimization disabled: unsupported game executable build.");
+        } else if (g_original_get_exit_code_thread == nullptr ||
             g_original_wait_for_single_object == nullptr ||
             g_original_get_thread_id == nullptr) {
             Log("Thread-join wait optimization unavailable: missing kernel32 exports.");
@@ -6408,14 +7057,15 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.log_timing_traffic) {
+    const bool needs_timer_period_hook =
+        g_config.log_timing_traffic ||
+        (g_supported_game_build &&
+            g_config.optimize_worker_state_wait &&
+            g_config.optimize_ui_thread_timer_period);
+    if (needs_timer_period_hook) {
         void* original_time_begin_period =
             reinterpret_cast<void*>(g_original_time_begin_period);
         void* original_time_end_period = reinterpret_cast<void*>(g_original_time_end_period);
-        void* original_wait_for_single_object =
-            reinterpret_cast<void*>(g_original_wait_for_single_object);
-        void* original_wait_for_multiple_objects =
-            reinterpret_cast<void*>(g_original_wait_for_multiple_objects);
 
         if (PatchIAT(
                 main_module,
@@ -6442,6 +7092,13 @@ void InstallHooks() {
         } else {
             Log("Failed to install timeEndPeriod hook.");
         }
+    }
+
+    if (g_config.log_timing_traffic) {
+        void* original_wait_for_single_object =
+            reinterpret_cast<void*>(g_original_wait_for_single_object);
+        void* original_wait_for_multiple_objects =
+            reinterpret_cast<void*>(g_original_wait_for_multiple_objects);
 
         if (PatchIAT(
                 main_module,
@@ -6541,24 +7198,29 @@ void InstallHooks() {
     }
 
     if (g_config.log_input_traffic) {
-        auto* base = reinterpret_cast<std::uint8_t*>(main_module);
-        void* original_qfps_element_copy = g_original_qfps_element_copy;
-        if (InstallInlineHook(
-                base + kQfpsElementCopyRva,
-                reinterpret_cast<void*>(HookedQfpsElementCopy),
-                &original_qfps_element_copy,
-                kQfpsElementCopyHookSize)) {
-            g_original_qfps_element_copy = original_qfps_element_copy;
-            Log("Installed QFPS element copy hook.");
+        if (!g_supported_game_build) {
+            Log("QFPS element copy probe disabled: unsupported game executable build.");
         } else {
-            Log("Failed to install QFPS element copy hook.");
+            auto* base = reinterpret_cast<std::uint8_t*>(main_module);
+            void* original_qfps_element_copy = g_original_qfps_element_copy;
+            if (InstallInlineHook(
+                    base + kQfpsElementCopyRva,
+                    reinterpret_cast<void*>(HookedQfpsElementCopy),
+                    &original_qfps_element_copy,
+                    kQfpsElementCopyHookSize)) {
+                g_original_qfps_element_copy = original_qfps_element_copy;
+                Log("Installed QFPS element copy hook.");
+            } else {
+                Log("Failed to install QFPS element copy hook.");
+            }
         }
     }
 
     if (g_config.log_input_traffic ||
-        g_config.optimize_get_cursor_pos_pair ||
-        g_config.optimize_idle_get_cursor_pos ||
-        g_config.disable_qfps_mouse_ctrl_lag) {
+        (g_supported_game_build &&
+            (g_config.optimize_get_cursor_pos_pair ||
+             g_config.optimize_idle_get_cursor_pos ||
+             g_config.disable_qfps_mouse_ctrl_lag))) {
         void* original_get_cursor_pos = reinterpret_cast<void*>(g_original_get_cursor_pos);
         if (PatchIAT(
                 main_module,
@@ -6574,7 +7236,8 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.log_input_traffic || g_config.optimize_screen_to_client_pair) {
+    if (g_config.log_input_traffic ||
+        (g_supported_game_build && g_config.optimize_screen_to_client_pair)) {
         void* original_screen_to_client = reinterpret_cast<void*>(g_original_screen_to_client);
         if (PatchIAT(
                 main_module,
@@ -6590,7 +7253,8 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.log_input_traffic || g_config.optimize_client_to_screen_origin) {
+    if (g_config.log_input_traffic ||
+        (g_supported_game_build && g_config.optimize_client_to_screen_origin)) {
         void* original_client_to_screen = reinterpret_cast<void*>(g_original_client_to_screen);
         if (PatchIAT(
                 main_module,
@@ -6606,7 +7270,8 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.log_input_traffic || g_config.optimize_get_client_rect_pair) {
+    if (g_config.log_input_traffic ||
+        (g_supported_game_build && g_config.optimize_get_client_rect_pair)) {
         void* original_get_client_rect = reinterpret_cast<void*>(g_original_get_client_rect);
         if (PatchIAT(
                 main_module,
@@ -6622,7 +7287,8 @@ void InstallHooks() {
         }
     }
 
-    if (g_config.log_input_traffic || g_config.optimize_idle_get_cursor_pos) {
+    if (g_config.log_input_traffic ||
+        (g_supported_game_build && g_config.optimize_idle_get_cursor_pos)) {
         void* original_direct_input8_create =
             reinterpret_cast<void*>(g_original_direct_input8_create);
         if (PatchIAT(
