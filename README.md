@@ -2,6 +2,8 @@ BioPatch is a standalone `.asi` plugin for Resident Evil Revelations 2.
 
 It focuses on replacing legacy code with cleaner modern behavior.
 
+Nexus mods: https://www.nexusmods.com/residentevilrevelations2/mods/144
+
 ## What BioPatch does
 
 - Timing cleanup:
